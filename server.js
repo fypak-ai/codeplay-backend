@@ -239,5 +239,16 @@ app.delete('/api/hack-tools/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+
+// POST /api/missions/reward
+app.post('/api/missions/reward', auth, (req, res) => {
+  const { xp, money } = req.body;
+  if (!xp && !money) return res.status(400).json({ error: 'xp ou money necessário' });
+  if (xp)    db.prepare('UPDATE users SET xp=xp+?, level=1+(xp/?) WHERE id=?').run(Number(xp)||0, 500, req.user.id);
+  if (money) db.prepare('UPDATE users SET wallet=wallet+? WHERE id=?').run(Number(money)||0, req.user.id);
+  const user = db.prepare('SELECT id,username,email,avatar,wallet,level,xp,created_at FROM users WHERE id=?').get(req.user.id);
+  res.json(user);
+});
+
 // ── Start ──────────────────────────────────────────────────────
 app.listen(PORT, () => console.log(`🚀 CodePlay API rodando na porta ${PORT}`));
