@@ -251,4 +251,186 @@ app.post('/api/missions/reward', auth, (req, res) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────
+// ── Admin tables
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER,
+    action TEXT NOT NULL,
+    target TEXT,
+    detail TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS features (
+    key TEXT PRIMARY KEY,
+    enabled INTEGER DEFAULT 1,
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+['missions','cloak','cloner','chat','tracker','hacker_lab','simuladores'].forEach(
+  k => db.prepare('INSERT OR IGNORE INTO features (key,enabled) VALUES (?,1)').run(k)
+);
+
+// ── Admin config
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'codeplay-admin-2026';
+
+function adminAuth(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Token admin necessario' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (!payload.isAdmin) return res.status(403).json({ error: 'Acesso negado' });
+    req.user = payload;
+    next();
+  } catch(_e) {
+    res.status(401).json({ error: 'Token invalido ou expirado' });
+  }
+}
+
+function logAdmin(adminId, action, target, detail) {
+  db.prepare('INSERT INTO admin_logs (admin_id,action,target,detail) VALUES (?,?,?,?)')
+    .run(adminId, action, target || null, detail || null);
+}
+
+// POST /api/admin/login
+app.post('/api/admin/login', (req, res) => {
+  const { secret } = req.body;
+  if (secret !== ADMIN_SECRET) return res.status(401).json({ error: 'Senha admin incorreta' });
+  const token = jwt.sign({ isAdmin: true, username: 'admin' }, JWT_SECRET, { expiresIn: '8h' });
+  res.json({ token });
+});
+
+// GET /api/admin/stats
+app.get('/api/admin/stats', adminAuth, (_req, res) => {
+  res.json({
+    users:     db.prepare('SELECT COUNT(*) as c FROM users').get().c,
+    apps:      db.prepare('SELECT COUNT(*) as c FROM apps').get().c,
+    purchases: db.prepare('SELECT COUNT(*) as c FROM purchases').get().c,
+    revenue:   db.prepare('SELECT COALESCE(SUM(price_paid),0) as s FROM purchases').get().s,
+    logs:      db.prepare('SELECT COUNT(*) as c FROM admin_logs').get().c,
+  });
+});
+
+// GET /api/admin/users
+app.get('/api/admin/users', adminAuth, (req, res) => {
+  const limit  = parseInt(req.query.limit)  || 50;
+  const offset = parseInt(req.query.offset) || 0;
+  const q      = req.query.q || '';
+  const users  = q
+    ? db.prepare('SELECT id,username,email,avatar,wallet,level,xp,created_at FROM users WHERE username LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?')
+        .all('%'+q+'%','%'+q+'%',limit,offset)
+    : db.prepare('SELECT id,username,email,avatar,wallet,level,xp,created_at FROM users ORDER BY id DESC LIMIT ? OFFSET ?')
+        .all(limit,offset);
+  res.json(users);
+});
+
+// POST /api/admin/users
+app.post('/api/admin/users', adminAuth, (req, res) => {
+  const { username, email, password, wallet } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: 'username, email e password obrigatorios' });
+  const bcr = require('bcryptjs');
+  try {
+    const hash = bcr.hashSync(password, 10);
+    const info = db.prepare('INSERT INTO users (username,email,password,wallet) VALUES (?,?,?,?)')
+      .run(username.trim(), email.trim().toLowerCase(), hash, wallet || 1000);
+    const user = db.prepare('SELECT id,username,email,wallet,level,xp,created_at FROM users WHERE id=?').get(info.lastInsertRowid);
+    logAdmin(0,'create_user','user:'+user.id, username);
+    res.status(201).json(user);
+  } catch(e) {
+    if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'username ou email ja existe' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /api/admin/users/:id
+app.patch('/api/admin/users/:id', adminAuth, (req, res) => {
+  const { wallet, level, xp, banned } = req.body;
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Usuario nao encontrado' });
+  if (wallet  !== undefined) db.prepare('UPDATE users SET wallet=? WHERE id=?').run(Number(wallet), u.id);
+  if (level   !== undefined) db.prepare('UPDATE users SET level=?  WHERE id=?').run(Number(level),  u.id);
+  if (xp      !== undefined) db.prepare('UPDATE users SET xp=?     WHERE id=?').run(Number(xp),     u.id);
+  if (banned  !== undefined) db.prepare('UPDATE users SET avatar=? WHERE id=?').run(banned ? 'BANNED' : u.avatar, u.id);
+  logAdmin(0,'edit_user','user:'+u.id, JSON.stringify(req.body));
+  res.json(db.prepare('SELECT id,username,email,avatar,wallet,level,xp,created_at FROM users WHERE id=?').get(u.id));
+});
+
+// DELETE /api/admin/users/:id
+app.delete('/api/admin/users/:id', adminAuth, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Usuario nao encontrado' });
+  db.prepare('DELETE FROM purchases  WHERE user_id=?').run(u.id);
+  db.prepare('DELETE FROM hack_tools WHERE owner_id=?').run(u.id);
+  db.prepare('DELETE FROM apps       WHERE owner_id=?').run(u.id);
+  db.prepare('DELETE FROM users      WHERE id=?').run(u.id);
+  logAdmin(0,'delete_user','user:'+u.id, u.username);
+  res.json({ ok: true });
+});
+
+// GET /api/admin/apps
+app.get('/api/admin/apps', adminAuth, (req, res) => {
+  const q = req.query.q || '';
+  const apps = q
+    ? db.prepare('SELECT a.*,u.username as owner_name FROM apps a JOIN users u ON a.owner_id=u.id WHERE a.name LIKE ? OR u.username LIKE ? ORDER BY a.created_at DESC LIMIT 100')
+        .all('%'+q+'%','%'+q+'%')
+    : db.prepare('SELECT a.*,u.username as owner_name FROM apps a JOIN users u ON a.owner_id=u.id ORDER BY a.created_at DESC LIMIT 100')
+        .all();
+  res.json(apps);
+});
+
+// POST /api/admin/apps
+app.post('/api/admin/apps', adminAuth, (req, res) => {
+  const { owner_id, name, description, category, price, emoji, color, code } = req.body;
+  if (!owner_id || !name) return res.status(400).json({ error: 'owner_id e name obrigatorios' });
+  const info = db.prepare('INSERT INTO apps (owner_id,name,description,category,price,emoji,color,code) VALUES (?,?,?,?,?,?,?,?)')
+    .run(owner_id, name, description||'', category||'Utilitario', price||0, emoji||'*', color||'#7c3aed', code||'');
+  logAdmin(0,'inject_app','app:'+info.lastInsertRowid, name);
+  res.status(201).json(db.prepare('SELECT * FROM apps WHERE id=?').get(info.lastInsertRowid));
+});
+
+// DELETE /api/admin/apps/:id
+app.delete('/api/admin/apps/:id', adminAuth, (req, res) => {
+  const a = db.prepare('SELECT * FROM apps WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'App nao encontrado' });
+  db.prepare('DELETE FROM purchases WHERE app_id=?').run(a.id);
+  db.prepare('DELETE FROM apps      WHERE id=?').run(a.id);
+  logAdmin(0,'delete_app','app:'+a.id, a.name);
+  res.json({ ok: true });
+});
+
+// GET /api/admin/features
+app.get('/api/admin/features', adminAuth, (_req, res) => {
+  res.json(db.prepare('SELECT * FROM features ORDER BY key').all());
+});
+
+// PATCH /api/admin/features/:key
+app.patch('/api/admin/features/:key', adminAuth, (req, res) => {
+  const { enabled } = req.body;
+  db.prepare("INSERT OR REPLACE INTO features (key,enabled,updated_at) VALUES (?,?,datetime('now'))")
+    .run(req.params.key, enabled ? 1 : 0);
+  logAdmin(0,'toggle_feature',req.params.key, enabled ? 'on' : 'off');
+  res.json({ key: req.params.key, enabled: !!enabled });
+});
+
+// GET /api/admin/logs
+app.get('/api/admin/logs', adminAuth, (_req, res) => {
+  res.json(db.prepare('SELECT * FROM admin_logs ORDER BY id DESC LIMIT 100').all());
+});
+
+// GET /api/admin/interactions
+app.get('/api/admin/interactions', adminAuth, (_req, res) => {
+  const purchases = db.prepare(
+    'SELECT p.id,p.purchased_at,p.price_paid,u.username,a.name as app_name FROM purchases p JOIN users u ON p.user_id=u.id JOIN apps a ON p.app_id=a.id ORDER BY p.purchased_at DESC LIMIT 50'
+  ).all();
+  res.json({ purchases });
+});
+
+// Public: GET /api/features
+app.get('/api/features', (_req, res) => {
+  const out = {};
+  db.prepare('SELECT key,enabled FROM features').all().forEach(r => { out[r.key] = !!r.enabled; });
+  res.json(out);
+});
+
+
 app.listen(PORT, () => console.log(`🚀 CodePlay API rodando na porta ${PORT}`));
